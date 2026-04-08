@@ -1,0 +1,48 @@
+{
+  "name": "react-native-mediapipe-pose-plugin",
+  "version": "0.1.0",
+  "description": "VisionCamera frame processor plugin wrapping Google MediaPipe Pose Landmarker for real-time on-device pose estimation in React Native. iOS (Swift) and Android (Kotlin), both production-validated.",
+  "files": [
+    "ios",
+    "android",
+    "example",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "react-native",
+    "react-native-vision-camera",
+    "vision-camera",
+    "frame-processor",
+    "frame-processor-plugin",
+    "mediapipe",
+    "mediapipe-pose",
+    "pose-landmarker",
+    "pose-detection",
+    "pose-estimation",
+    "pose",
+    "ios",
+    "android",
+    "swift",
+    "kotlin",
+    "ml",
+    "machine-learning",
+    "computer-vision"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/munishbp/react-native-mediapipe-pose-plugin.git"
+  },
+  "homepage": "https://github.com/munishbp/react-native-mediapipe-pose-plugin#readme",
+  "bugs": {
+    "url": "https://github.com/munishbp/react-native-mediapipe-pose-plugin/issues"
+  },
+  "author": "Munish Persaud",
+  "license": "MIT",
+  "peerDependencies": {
+    "react": "*",
+    "react-native": ">=0.81.0",
+    "react-native-vision-camera": ">=4.7.0",
+    "react-native-worklets-core": ">=1.6.0"
+  }
+}
