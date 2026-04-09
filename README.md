@@ -1,6 +1,6 @@
 # react-native-mediapipe-pose-plugin
 
-A [VisionCamera](https://github.com/mrousavy/react-native-vision-camera) frame processor plugin wrapping Google's [MediaPipe Pose Landmarker](https://ai.google.dev/edge/mediapipe/solutions/vision/pose_landmarker) for real-time, on-device pose estimation in React Native. iOS (Swift) and Android (Kotlin), both production-validated.
+A [VisionCamera](https://github.com/mrousavy/react-native-vision-camera) frame processor plugin wrapping Google's [MediaPipe Pose Landmarker](https://ai.google.dev/edge/mediapipe/solutions/vision/pose_landmarker) AND [Hand Landmarker](https://ai.google.dev/edge/mediapipe/solutions/vision/hand_landmarker) for real-time, on-device pose + hand estimation in React Native. iOS (Swift) and Android (Kotlin), both production-validated. A single plugin call returns both pose AND hand landmarks from the same frame.
 
 ## Origin
 
@@ -26,13 +26,15 @@ This plugin avoids all of that by being a small set of native files added direct
 ## Features
 
 - 33 3D pose landmarks (x, y, z, visibility) per detected person
-- GPU acceleration on both platforms — Metal delegate on iOS, MediaPipe GPU delegate on Android with automatic CPU fallback
+- 21 hand landmarks per detected hand, up to 2 hands per frame, with `"Left"`/`"Right"` handedness label — returned alongside the pose result in the same plugin call
+- GPU acceleration on both platforms — Metal delegate on iOS, MediaPipe GPU delegate on Android with automatic CPU fallback (per landmarker independently)
 - Synchronous `.video` running mode — predictable per-frame latency, no async listener / delegate plumbing
-- ~10–20 ms per frame inference on iPhone 16 Pro Max and Pixel 7
-- Single-person tracking by default (`numPoses = 1`), confidence floors at `0.3` for full-body distance
+- ~10–20 ms per frame inference on iPhone 16 Pro Max and Pixel 7 (pose + hands combined)
+- Single-person tracking by default (`numPoses = 1`), confidence floors at `0.3` for full-body distance; hand confidence floors at `0.4` (slightly stricter, hand detection at distance has more false positives)
 - Built-in temporal smoothing from MediaPipe's detect-then-track architecture
 - Compatible with VisionCamera v4+
 - Works with bare React Native and Expo bare workflow
+- Ships diagnostic shell scripts (`ios-doctor.sh` / `android-doctor.sh` / `ios-clean.sh` / `android-clean.sh`) that consumers can drop into their own app's `scripts/` folder to preflight a build environment or nuke a stuck native build cache
 
 ## Validation
 
@@ -60,7 +62,7 @@ The exact production environment AI-PEER validated against, end-to-end:
 - Deterministic latency — synchronous `.video` mode means no jitter from async listener queuing
 
 ### Use case validated
-Real-time exercise-form analysis with downstream COCO-17 keypoint mapping. Left/right clinical correctness verified end-to-end on a left-side hip-abductor exercise on Pixel 7 (AI-PEER's R3 acceptance test).
+Real-time exercise-form analysis with downstream COCO-17 keypoint mapping. Left/right clinical correctness verified end-to-end on a left-side hip-abductor exercise on Pixel 7 (AI-PEER's R3 acceptance test). The hand-detection path is validated by AI-PEER's "open palm" gesture-confirm session-start UI: the user holds a forward-facing open palm for 1 second to begin a tracked exercise. The handedness label is required because the JS palm-vs-back-of-hand check uses a finger cross product whose sign flips between left and right hands — knowing which hand it is, is what makes the disambiguation work.
 
 ---
 
@@ -125,15 +127,21 @@ Dir.glob(File.join(installer.sandbox.root, 'Target Support Files', '**', '*.xcco
 end
 ```
 
-### 4. Download the model
+### 4. Download the models
 
-Download `pose_landmarker_full.task` from Google's CDN:
+Download both model files from Google's CDN:
 
 ```
+# Pose model (~9 MB)
 https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_full/float16/latest/pose_landmarker_full.task
+
+# Hand model (~6 MB) — required as of v0.2.0; without it the plugin still
+# detects pose but logs "[HandLandmarker] Model file not found in bundle"
+# and returns hands: [] on every frame.
+https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/latest/hand_landmarker.task
 ```
 
-Add it to your Xcode project (`ios/<YourApp>/`) and ensure **"Copy Bundle Resources"** is checked on the file in Xcode's Build Phases.
+Add **both files** to your Xcode project (`ios/<YourApp>/`) and ensure **"Copy Bundle Resources"** is checked on each in Xcode's Build Phases. The Swift plugin loads them by name (`pose_landmarker_full.task`, `hand_landmarker.task`) from `Bundle.main` — they must be present in the app bundle, not as Xcode file references only.
 
 ### 5. Add the plugin files
 
@@ -167,19 +175,25 @@ import { useRunOnJS } from 'react-native-worklets-core';
 const plugin = VisionCameraProxy.initFrameProcessorPlugin('poseLandmarker', {});
 
 function CameraView() {
-  const handlePose = (landmarks) => {
-    // landmarks[i] = { x, y, z, visibility }, 33 entries, normalized 0–1
+  const handleResult = (result) => {
+    // result.pose:  33 entries  → { x, y, z, visibility? }, normalized 0–1
+    // result.hands: 0..2 hands  → { landmarks: [...21 {x,y,z}], handedness: 'Left' | 'Right' | '' }
+    //
+    // Example:
+    //   const noseY = result.pose[0].y;
+    //   const firstHand = result.hands[0];        // may be undefined
+    //   const isRightHand = firstHand?.handedness === 'Right';
   };
-  const onPose = useRunOnJS(handlePose, []);
+  const onResult = useRunOnJS(handleResult, []);
 
   const frameProcessor = useFrameProcessor((frame) => {
     'worklet';
     if (!plugin) return;
-    const landmarks = plugin.call(frame);
-    if (Array.isArray(landmarks) && landmarks.length >= 33) {
-      onPose(landmarks);
+    const result = plugin.call(frame);
+    if (result && Array.isArray(result.pose) && result.pose.length >= 33) {
+      onResult(result);
     }
-  }, [onPose]);
+  }, [onResult]);
 
   return (
     <Camera
@@ -191,6 +205,8 @@ function CameraView() {
   );
 }
 ```
+
+> **Breaking change in v0.2.0.** The plugin now returns a `{ pose, hands }` dict instead of a bare landmark array. If you're upgrading from 0.1.x, change `Array.isArray(result)` to `result && Array.isArray(result.pose)` and read `result.pose` where you previously read `result`. `result.hands` is always an array (possibly empty), never `undefined` — even if MediaPipe's HandLandmarker fails to initialize entirely (you'll see a `[HandLandmarker] Failed to init` log line, and every `result.hands` will be `[]`, but pose detection still runs).
 
 The `'worklet'` directive is mandatory on the frame processor function — it tells `react-native-worklets-core` to compile it for the camera thread. The `pixelFormat="rgb"` prop is also mandatory; MediaPipe expects RGBA frames, and on Android the Kotlin plugin defensively rejects non-RGBA frames.
 
@@ -219,19 +235,28 @@ androidResources {
 }
 ```
 
-### 3. Download the model
+### 3. Download the models
 
-Same file as iOS, different location:
+Same files as iOS, different location:
 
 ```
 android/app/src/main/assets/pose_landmarker_full.task
+android/app/src/main/assets/hand_landmarker.task
 ```
 
 Download from Google's CDN:
 
 ```
+# Pose model (~9 MB)
 https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_full/float16/latest/pose_landmarker_full.task
+
+# Hand model (~6 MB) — required as of v0.2.0; without it the Kotlin plugin
+# logs "createHandLandmarker(delegate=GPU) failed" and disables hand
+# detection while keeping pose detection running.
+https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/latest/hand_landmarker.task
 ```
+
+The `noCompress += "task"` rule from Step 2 already covers both files (it matches by file extension), so you do NOT need to repeat it.
 
 ### 4. Copy the Kotlin plugin file
 
@@ -270,7 +295,41 @@ The plugin name `"poseLandmarker"` MUST match exactly what iOS exports (`VISION_
 
 On the `<Camera>` component in JS, `pixelFormat="rgb"` is required. CameraX needs `OUTPUT_IMAGE_FORMAT_RGBA_8888` and the Kotlin plugin defensively rejects non-RGBA frames with a loud log line.
 
-### 7. Use it from JavaScript
+### 7. Build hardening (recommended)
+
+Adding MediaPipe + VisionCamera + worklets-core to an Android RN app multiplies the amount of native CMake / NDK work the Gradle build has to do. On a fresh clone of a project that uses all three, builds can fail with:
+
+```
+Fail to run Gradle Worker Daemon
+> Build failed with an exception.
+> A failure occurred while executing org.jetbrains.kotlin.gradle.tasks.KotlinCompile$KotlinCompileTask
+> Process 'Gradle Worker Daemon 1' finished with non-zero exit value 137
+```
+
+The exit code 137 is the OOM signal. The root cause is almost always the Gradle daemon running out of heap while forking worker JVMs to compile Kotlin / javac / CMake all in parallel across four target architectures. The fix is three lines in `android/gradle.properties`:
+
+```properties
+# 1. Cap architectures: every modern Android phone is arm64-v8a. Building all
+# four (armeabi-v7a, arm64-v8a, x86, x86_64) quadruples CMake work across
+# VisionCamera / reanimated / worklets-core / MediaPipe — the main cause of
+# daemon OOM on fresh clones. CLI override for multi-arch release builds:
+#   ./gradlew assembleRelease -PreactNativeArchitectures=arm64-v8a,armeabi-v7a,x86,x86_64
+reactNativeArchitectures=arm64-v8a
+
+# 2. Bumped from the RN default -Xmx2048m. 4 GB max heap is safe on any 8 GB+
+# machine and gives the daemon room to fork worker JVMs while CMake tasks
+# are running. HeapDumpOnOutOfMemoryError leaves a dump for next time.
+org.gradle.jvmargs=-Xmx4096m -XX:MaxMetaspaceSize=1024m -XX:+HeapDumpOnOutOfMemoryError
+
+# 3. Cap concurrent worker JVMs. Default is availableProcessors(), which on a
+# 16-core machine forks 16 workers each with their own heap and OOMs the
+# daemon on modest-RAM laptops. 4 keeps total fork pressure bounded.
+org.gradle.workers.max=4
+```
+
+Most consumers will not need to ship multi-arch APKs in dev (every physical Android phone since ~2018 is arm64-v8a — the other architectures only exist for emulators and ancient hardware). Override on the CLI when you need a Play Store release build.
+
+### 8. Use it from JavaScript
 
 The JS code is identical to iOS — see the [iOS Step 7](#7-use-it-from-javascript) snippet above. The shared TS layer handles platform differences via `Platform.OS === 'android'` (see [Coordinate Transforms](#coordinate-transforms)).
 
@@ -285,6 +344,66 @@ The shipped Kotlin plugin handles the following — most of this knowledge is en
 - **JSI bridge `Float → Double` upcast.** VisionCamera v4's JSI bridge on Android does NOT accept `java.lang.Float` (`"Cannot convert Java type 'class java.lang.Float' to jsi::Value!"`). The plugin explicitly upcasts each `lm.x() / .y() / .z() / .visibility()` to `Double` before boxing into the result map. JS receives plain `number` either way.
 - **No manual cleanup.** Do NOT call `mediaImage.close()` or `mpImage.close()`. VisionCamera retains the underlying ImageProxy via reference counting and releases it after `callback()` returns; closing it ourselves corrupts the next frame.
 - **RGBA_8888 format check.** The plugin verifies `mediaImage.format == PixelFormat.RGBA_8888` and returns `null` with an error log otherwise. This catches a regression where someone removes `pixelFormat="rgb"` from the Camera component.
+
+---
+
+## Diagnostic scripts
+
+This package ships four shell scripts under `scripts/` that you can drop into your own app's `scripts/` folder to preflight a build environment or recover from a stuck native build cache. They're cross-platform (macOS, Linux, Windows Git Bash), read-only on the doctor side, and explicit about what they touch on the clean side.
+
+| Script | Type | What it does |
+| --- | --- | --- |
+| `scripts/ios-doctor.sh` | Read-only check | Verifies Xcode ≥ 16, Command Line Tools points at `/Applications/Xcode.app`, Node version vs `.nvmrc`, CocoaPods ≥ 1.16, `ios/Pods/` present, `.env` present, the three plugin peerDeps in `node_modules/`, and that `pose_landmarker_full.task` + `hand_landmarker.task` exist somewhere under `ios/`. Exits 0 if every check passes, 1 otherwise. |
+| `scripts/android-doctor.sh` | Read-only check | Verifies JDK 17/21 (via PATH or JAVA_HOME — accepts Android Studio's bundled JBR on Windows where `java` isn't on PATH), `JAVA_HOME` validity, `ANDROID_HOME`/`ANDROID_SDK_ROOT`, `adb` (PATH or under `$ANDROID_HOME/platform-tools`), platform-tools install, NDK presence, Node vs `.nvmrc`, `.env`, the three plugin peerDeps, `android/gradlew` checked in, and total system RAM (warns if < 8 GB). |
+| `scripts/ios-clean.sh` | Destructive (with explicit warning) | Deintegrates CocoaPods, wipes `ios/Pods` + `ios/Podfile.lock` + `ios/build`, wipes `~/Library/Developer/Xcode/DerivedData` (shared across **all** Xcode projects on the machine, not just yours), then re-runs `pod install`. Use when iOS builds fail with mysterious template / module / linker errors after a Podfile change. |
+| `scripts/android-clean.sh` | Destructive (with explicit warning) | Wipes `android/.gradle` + `android/build` + `android/app/build` + `android/app/.cxx`, then runs `./gradlew clean`. Does NOT touch `~/.gradle` (shared cache, would cost hours of redownloads) or `node_modules`. Use when Android builds fail with mysterious Kotlin / CMake / dex errors. |
+
+### Installing the scripts in your app
+
+Copy from the package into your app's `scripts/` folder:
+
+```bash
+mkdir -p scripts
+cp node_modules/react-native-mediapipe-pose-plugin/scripts/ios-doctor.sh scripts/
+cp node_modules/react-native-mediapipe-pose-plugin/scripts/ios-clean.sh scripts/
+cp node_modules/react-native-mediapipe-pose-plugin/scripts/android-doctor.sh scripts/
+cp node_modules/react-native-mediapipe-pose-plugin/scripts/android-clean.sh scripts/
+chmod +x scripts/*.sh
+```
+
+Then add the four entries to your app's `package.json` `scripts` block:
+
+```json
+"scripts": {
+  "ios:doctor": "bash scripts/ios-doctor.sh",
+  "ios:clean": "bash scripts/ios-clean.sh",
+  "android:doctor": "bash scripts/android-doctor.sh",
+  "android:clean": "bash scripts/android-clean.sh"
+}
+```
+
+### Using them
+
+**Before every build on a fresh machine** (or after pulling a branch that touches native deps), run the doctor:
+
+```bash
+npm run ios:doctor      # before pod install / xcodebuild / Xcode
+npm run android:doctor  # before ./gradlew assembleDebug / npx expo run:android
+```
+
+**When a build fails with "works on my machine" weirdness**, run the matching clean and try the build again:
+
+```bash
+npm run ios:clean
+# then: cd ios && pod install && open <YourApp>.xcworkspace, then Cmd+Shift+K, then build
+
+npm run android:clean
+# then: npx expo run:android  (or: npm run android)
+```
+
+### Windows note
+
+If you're on Windows Git Bash, the scripts work as-is. The shipped `.gitattributes` enforces `*.sh text eol=lf` so the shebang doesn't get a stray `\r` on first clone — without that, Bash fails to start the script with `env: bash\r: No such file or directory`. If you `cp` the scripts into your own app, copy `.gitattributes` (or its `*.sh text eol=lf` rule) along with them.
 
 ---
 
@@ -313,6 +432,17 @@ const portraitY = 1 - lm.x;  // Y-flip to compensate for CameraX vertical orient
 ```
 
 Because the buffer isn't pre-mirrored, MediaPipe's L/R labels already match the user's body — use the natural (non-swapped) [`MEDIAPIPE_TO_COCO_ANDROID`](#mediapipe--coco-mapping) table.
+
+### Hands
+
+Hand landmarks live in the **same** raw camera coordinate space as pose landmarks — both come back from MediaPipe in normalized 0–1 sensor coordinates with no rotation applied. So the same per-platform transform applies to both:
+
+```typescript
+const portraitX = lm.y;
+const portraitY = Platform.OS === 'android' ? 1 - lm.x : lm.x;
+```
+
+If you're rendering hands on top of pose (e.g. drawing a finger overlay on a person's wrist), apply the rotation once per landmark and they'll line up. If they don't, the most likely cause is rotating pose but not hands (or vice versa).
 
 ### Cross-platform mapping function
 
@@ -442,15 +572,14 @@ A few things to note about the indices:
 
 ## Roadmap
 
-This package currently ships as a "drag the files into your app" install model — no `npm install`, no autolinking. That's a deliberate first step (it sidesteps every CocoaPods/gradle autolinking bug we hit while building it), but there's room to make it more ergonomic. Open contributions welcome on:
+This package currently ships as a "drag the files into your app" install model — no autolinking. That's a deliberate first step (it sidesteps every CocoaPods/gradle autolinking bug we hit while building it), but there's room to make it more ergonomic. Open contributions welcome on:
 
-- **`package.json` for npm publication** so consumers can `npm install react-native-mediapipe-pose-plugin` instead of cloning this repo
 - **Generalize `ios/PoseLandmarkerPlugin.m`** so it doesn't ship with `AIPEER-Swift.h` hardcoded — replace with a `<YOUR_APP>-Swift.h` placeholder + clear comment
-- **Generalize the Kotlin file's package declaration** to a more obvious placeholder
-- **Ship as a real autolinked RN library** — CocoaPods podspec + gradle module — so the install model becomes `npm install` instead of "drag files in"
+- **Ship as a real autolinked RN library** — CocoaPods podspec + gradle module — so the install model becomes pure `npm install` instead of "copy native files in"
 - **Extract a `src/` TypeScript module** (types, hook, COCO mapper) so consumers can `import { useMediaPipePose }` instead of copy-pasting from `example/`
-- **`.npmignore`, `.gitignore`, `CHANGELOG.md`**
-- **Minimal runnable example app** (Expo bare workflow) showing the plugin end-to-end with on-screen landmark rendering
+- **CHANGELOG.md** tracking version-to-version contract changes (e.g. the 0.1 → 0.2 return-shape break documented above)
+- **Minimal runnable example app** (Expo bare workflow) showing the plugin end-to-end with on-screen pose + hand landmark rendering
+- **MediaPipe Hand Landmarks reference table** in this README, mirroring the existing 33-pose table
 
 ---
 

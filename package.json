@@ -1,11 +1,12 @@
 {
   "name": "react-native-mediapipe-pose-plugin",
-  "version": "0.1.0",
-  "description": "VisionCamera frame processor plugin wrapping Google MediaPipe Pose Landmarker for real-time on-device pose estimation in React Native. iOS (Swift) and Android (Kotlin), both production-validated.",
+  "version": "0.2.0",
+  "description": "VisionCamera frame processor plugin wrapping Google MediaPipe Pose Landmarker (and Hand Landmarker) for real-time on-device pose + hand estimation in React Native. iOS (Swift) and Android (Kotlin), both production-validated.",
   "files": [
     "ios",
     "android",
     "example",
+    "scripts",
     "README.md",
     "LICENSE"
   ],

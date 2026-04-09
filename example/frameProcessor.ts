@@ -2,7 +2,19 @@
  * Example: Using the PoseLandmarker VisionCamera plugin in React Native
  *
  * This shows how to call the native plugin from a VisionCamera frame processor
- * and convert the 33 MediaPipe landmarks to 17 COCO-compatible keypoints.
+ * and convert the 33 MediaPipe pose landmarks to 17 COCO-compatible keypoints,
+ * plus how to receive the optional 21-landmark hand results that come back
+ * from the same plugin call.
+ *
+ * ──────────────────────────────────────────────────────────────────────────
+ * RETURN-SHAPE NOTE (v0.2.0):
+ * As of v0.2.0 the native plugin returns a unified `{ pose, hands }` dict on
+ * every frame instead of a bare landmark array. `pose` is the 33-entry pose
+ * landmark array (same as before). `hands` is an array of 0..2 hands, each
+ * shaped `{ landmarks: [...21], handedness: 'Left' | 'Right' | '' }`. If you
+ * are upgrading from 0.1.x, the worklet's `Array.isArray(result)` check has
+ * to become `result && Array.isArray(result.pose)`.
+ * ──────────────────────────────────────────────────────────────────────────
  */
 
 import { useCallback, useRef } from 'react';
@@ -12,12 +24,26 @@ import { useRunOnJS } from 'react-native-worklets-core';
 // Initialize the native plugin (must match the name in PoseLandmarkerPlugin.m)
 const plugin = VisionCameraProxy.initFrameProcessorPlugin('poseLandmarker', {});
 
-// MediaPipe landmark type (33 per person)
+// MediaPipe pose landmark type (33 per person)
 type Landmark = {
   x: number;       // normalized 0-1
   y: number;       // normalized 0-1
   z: number;       // depth relative to hip midpoint
   visibility?: number; // 0-1 confidence
+};
+
+// One hand result from the native plugin. `landmarks` has 21 entries
+// (MediaPipe's hand landmark count). `handedness` is "Left" or "Right" as
+// reported by MediaPipe, or an empty string if MediaPipe didn't return one.
+type Hand = {
+  landmarks: Landmark[];
+  handedness: 'Left' | 'Right' | '';
+};
+
+// The full per-frame return shape from the native plugin.
+type PoseFrameResult = {
+  pose: Landmark[];
+  hands: Hand[];
 };
 
 // Maps MediaPipe 33 landmarks → 17 COCO keypoint names.
@@ -62,32 +88,47 @@ function mapLandmarksToPose(landmarks: Landmark[]) {
 }
 
 /**
- * Hook that returns a VisionCamera frame processor with MediaPipe pose detection.
+ * What the JS-side callback receives once per frame:
+ *   - `keypoints`: 17 COCO-mapped pose keypoints (or null if pose detection failed)
+ *   - `hands`: 0..2 raw hand results from MediaPipe (each has 21 landmarks +
+ *              "Left"/"Right"/"" handedness). Empty array if no hand was
+ *              detected on this frame, or if the native HandLandmarker failed
+ *              to initialize entirely.
  */
-export function usePoseFrameProcessor(onPoseDetected: (keypoints: any[] | null) => void) {
-  const callbackRef = useRef(onPoseDetected);
-  callbackRef.current = onPoseDetected;
+type DetectionResult = {
+  keypoints: ReturnType<typeof mapLandmarksToPose>;
+  hands: Hand[];
+};
 
-  const handleLandmarks = useCallback((landmarks: Landmark[] | null) => {
-    if (!landmarks) {
-      callbackRef.current(null);
-      return;
-    }
-    callbackRef.current(mapLandmarksToPose(landmarks));
+/**
+ * Hook that returns a VisionCamera frame processor with MediaPipe pose +
+ * hand detection. The supplied callback fires once per frame on the JS thread.
+ */
+export function usePoseFrameProcessor(
+  onDetection: (result: DetectionResult | null) => void
+) {
+  const callbackRef = useRef(onDetection);
+  callbackRef.current = onDetection;
+
+  const handleResult = useCallback((result: DetectionResult | null) => {
+    callbackRef.current(result);
   }, []);
 
-  const handleOnJS = useRunOnJS(handleLandmarks, [handleLandmarks]);
+  const handleOnJS = useRunOnJS(handleResult, [handleResult]);
 
   const frameProcessor = useFrameProcessor((frame) => {
     'worklet';
     if (!plugin) return;
 
-    const result = plugin.call(frame);
-    if (!result || !Array.isArray(result) || result.length < 33) {
+    const result = plugin.call(frame) as unknown as PoseFrameResult | undefined;
+    if (!result || !Array.isArray(result.pose) || result.pose.length < 33) {
       handleOnJS(null);
       return;
     }
-    handleOnJS(result as unknown as Landmark[]);
+    handleOnJS({
+      keypoints: mapLandmarksToPose(result.pose),
+      hands: Array.isArray(result.hands) ? result.hands : [],
+    });
   }, [handleOnJS]);
 
   return frameProcessor;
